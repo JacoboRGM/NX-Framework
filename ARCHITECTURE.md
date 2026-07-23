@@ -124,3 +124,92 @@ See **[API.md](API.md)** for the full reference.
 - **A single shared scratch buffer (`api_scratch_buffer`) renders every outgoing command.** This keeps RAM usage flat regardless of how many attributes exist, at the cost of **not being reentrant** — see [Known Limitations](../README.md#known-limitations) in the README.
 - **Ownership validation lives at the API layer, not the object layer.** `NX_PageContainsObject` is what gatekeeps whether a `NX_SetX`-style call is even allowed to reach the wire; it's intentionally cheap (an ID comparison / array scan) rather than tracking back-pointers on every object, trading a small amount of runtime safety for simplicity in the static object model.
 - **The event system has two entry points** (`NX_eventDispatch` for raw incoming vectors, `NX_ScreenDispatchTouchEvent` for pre-parsed page/component IDs) that currently share logic by duplication rather than a common helper — a known refactor target.
+
+---
+
+## Interrupt-Driven I/O (Reference dsPIC33 Integration)
+
+The core's transport layer (Layer 3) never touches an interrupt vector directly — it only exposes `NX_Transport_RxCallback`, `NX_Transport_TxCallback`, and `NX_Transport_Tasks` for *something* to call periodically. This section documents how the bundled dsPIC33 reference integration (`lib/drivers/uart` + `main.c`) actually drives those calls, because it involves **two independent buffering layers governed by three different interrupt contexts** — easy to misread as one simple send/receive path if you only look at `nx_transport.c`.
+
+| Layer | Granularity | Drained by |
+|---|---|---|
+| Core `NX_VectorFifo_t` (`txFifo`/`rxFifo` in `NX_Transport_t`) | One whole framed command per slot | A periodic call to `NX_Transport_Tasks()` |
+| UART driver's software ring buffer (`tx_ring`, 512 bytes) + 8-level hardware FIFO | Raw bytes | The UART peripheral's own TX-empty hardware interrupt |
+
+### Transmit path
+
+```mermaid
+sequenceDiagram
+    participant App as Application code
+    participant API as nx_api.c
+    participant CoreFifo as Core txFifo
+    participant Tasks as NX_Transport_Tasks()
+    participant Send as NX_send() glue (main.c)
+    participant Ring as UART TX ring buffer (512B)
+    participant HwFifo as UART hardware FIFO (8 levels)
+    participant TxISR as _U2TXInterrupt
+
+    App->>API: NX_SetText(...) / any setter
+    API->>CoreFifo: enqueue rendered command (non-blocking, returns immediately)
+    Note over CoreFifo: Command just waits here until the<br/>next periodic Tasks() call — nothing is<br/>on the wire yet.
+
+    rect rgb(240,240,240)
+    Note over Tasks: Driven by the TMR1 timer ISR<br/>(tmr0_tick, every 3rd tick) in this reference build
+    Tasks->>CoreFifo: pop one vector
+    Tasks->>Send: hand off bytes + mandatory 0xFF 0xFF 0xFF terminator
+    Send->>Ring: UART_Write_Buffer() copies bytes into ring
+    opt TX hardware currently idle (U2TXIE == 0)
+        Ring->>HwFifo: kick-start — push bytes directly into U2TXREG
+        Ring->>TxISR: enable U2TXIE
+    end
+    end
+
+    loop until ring buffer drained
+        HwFifo-->>TxISR: hardware FIFO reports empty (UTXISEL=2)
+        TxISR->>HwFifo: refill from ring buffer
+    end
+
+    TxISR->>TxISR: ring buffer also empty now
+    TxISR->>TxISR: disable U2TXIE
+    TxISR-->>App: fires UART_EVENT_TX_COMPLETE
+```
+
+Two things worth calling out explicitly:
+
+- **A single "frame" enqueued at the core level can span several hardware TX-interrupt cycles.** The core doesn't know or care that the 8-level hardware FIFO is smaller than the frame it just handed off — `uartDriver.c` refills the FIFO from its own 512-byte ring buffer every time `_U2TXInterrupt` fires, transparently, until the ring buffer itself is exhausted.
+- **`UART_EVENT_TX_COMPLETE` is currently an unused hook in the reference `main.c`** (`event_callback()` just toggles an LED on that event). It exists so an application can, for example, throttle how fast it feeds new frames to the core's `txFifo`, or gate a low-power sleep transition on "everything has actually left the wire" — but nothing in this repo wires it back into the core today.
+- **`NX_Transport_Tasks()` runs inside a timer ISR (TMR1) in this reference build**, not the main loop, and it manipulates the same `tx_ring`/`tx_head`/`tx_tail` state that the actual UART TX interrupt (`_U2TXInterrupt`) also touches. `UART_Write_Buffer()`'s ring-index bookkeeping is written defensively for this (it only ever kick-starts the hardware FIFO once, then lets the TX ISR own draining), but if you change *which* context calls `NX_Transport_Tasks()` on your own port, re-verify that it can't preempt `_U2TXInterrupt` mid-update — or move it to the main loop instead, which the core supports equally well (see [Known Limitations](../README.md#known-limitations) regarding reentrancy of the API layer's scratch buffer, which applies here too).
+
+### Receive path
+
+```mermaid
+sequenceDiagram
+    participant Wire as Nextion panel (UART TX)
+    participant RxISR as _U2RXInterrupt
+    participant Glue as rx_interrupt_callback() (main.c)
+    participant CoreRx as NX_Transport_RxCallback()
+    participant RxFifo as Core rxFifo
+    participant Tasks as NX_Transport_Tasks()
+    participant Dispatch as NX_eventDispatch()
+
+    Wire-->>RxISR: byte arrives (fires per byte, URXISEL=0)
+    RxISR->>RxISR: accumulate into rx_frame[], watch for 0xFF 0xFF 0xFF
+    Note over RxISR: On the 3rd consecutive 0xFF,<br/>the frame is considered complete.
+    RxISR->>Glue: Rx_Frame_Ready_Callback(rx_frame, length)
+    Glue->>CoreRx: transport->rx_hardware_func(screen, buffer, length)
+    CoreRx->>RxFifo: push completed frame as one NX_Vector_t
+    Note over RxFifo: Still inside the original UART RX<br/>interrupt context up to this point.
+
+    rect rgb(240,240,240)
+    Note over Tasks: Driven by the TMR1 timer ISR, same cadence as TX
+    Tasks->>RxFifo: pop one vector
+    Tasks->>Dispatch: NX_eventDispatch(screen, vector)
+    Dispatch->>Dispatch: fire onPress/onRelease, or forward to globalEvent
+    end
+```
+
+The RX frame is *captured* synchronously inside the UART RX interrupt (byte-by-byte, terminator-detected), but it is only *processed* — touch dispatch, data-reply parsing — later, decoupled, on the same periodic `NX_Transport_Tasks()` cadence that drains TX. This is why `NX_Transport_Tasks()` must run frequently enough for your application's latency requirements: it's the single point where both directions of traffic actually get serviced past the byte level.
+
+### Porting note
+
+None of the above is required by the core — it's this reference integration's choice to drive `NX_Transport_Tasks()` from a timer ISR and to give the UART driver its own byte-level ring buffer. A simpler port could just as validly call `NX_Transport_Tasks()` from the main loop on every iteration, or from a lower-priority interrupt, provided it's called often enough relative to your baud rate and the panel's response latency. See [README.md — Requirements](../README.md#requirements) for the porting boundary.

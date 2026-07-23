@@ -1,4 +1,4 @@
-# Nextion HMI Framework
+# Nextion HMI C Driver (dsPIC33 / XC16)
 
 A layered, object-oriented C driver for **Nextion HMI displays**. The core (`lib/core`) is **MCU-agnostic** — it depends only on two function pointers (`tx`/`rx` callbacks, see [ARCHITECTURE.md](docs/ARCHITECTURE.md#layer-3--transport)) to talk to any UART peripheral, so it compiles and runs on any C99-capable target. It has been developed and tested on a **Microchip dsPIC33CH512MP508** with **MPLAB X** / **XC16**, which is why this repo also ships a ready-made UART driver and MCC-generated startup code for that specific part — but that's a reference integration, not a hard dependency of the driver itself.
 
@@ -117,6 +117,8 @@ void rx_interrupt_callback(const uint8_t *buffer, uint16_t length) {
 ```
 
 Touch events are dispatched automatically to the `onPress` / `onRelease` callback registered on each `NX_Object_t` — no manual switch/case needed in application code.
+
+> **How the bytes actually move:** enqueueing a command via the API (e.g. `NX_SetText`) does not put anything on the wire by itself — it only queues a frame in the core's internal FIFO. A periodic call to `NX_Transport_Tasks()` (driven by a timer interrupt in the reference dsPIC33 build) is what flushes that queue down to the UART driver's own byte-level ring buffer and hardware FIFO. See [docs/ARCHITECTURE.md — Interrupt-Driven I/O](docs/ARCHITECTURE.md#interrupt-driven-io-reference-dspic33-integration) for the full TX/RX interrupt chain.
 
 ---
 
