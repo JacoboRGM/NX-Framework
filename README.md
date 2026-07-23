@@ -1,4 +1,5 @@
-# Nextion HMI C Driver (dsPIC33 / XC16)
+# Nextion HMI Framework
+
 
 A layered, object-oriented C driver for **Nextion HMI displays**. The core (`lib/core`) is **MCU-agnostic** — it depends only on two function pointers (`tx`/`rx` callbacks, see [ARCHITECTURE.md](docs/ARCHITECTURE.md#layer-3--transport)) to talk to any UART peripheral, so it compiles and runs on any C99-capable target. It has been developed and tested on a **Microchip dsPIC33CH512MP508** with **MPLAB X** / **XC16**, which is why this repo also ships a ready-made UART driver and MCC-generated startup code for that specific part — but that's a reference integration, not a hard dependency of the driver itself.
 
